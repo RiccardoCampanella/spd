@@ -217,26 +217,38 @@ def generate_commands(
     return commands
 
 
+import os
+import subprocess
+import shlex
+
 def run_commands_locally(commands: list[str]) -> None:
-    """Execute commands locally in sequence.
-
-    Args:
-        commands: List of shell commands to execute
-    """
-
+    """Execute commands locally in sequence."""
     logger.section(f"LOCAL EXECUTION: Running {len(commands)} tasks")
 
     for i, command in enumerate(commands, 1):
-        # Parse command into arguments
         args = shlex.split(command)
 
-        # Extract experiment name from script path for cleaner output
-        # Skip environment variables (VAR=value format) to find the python script
-        script_path = next(arg for arg in args if "=" not in arg and arg.endswith(".py"))
+        # Separate environment variables from the actual command
+        env_vars = {}
+        cmd_args = []
+        for arg in args:
+            if "=" in arg and not arg.endswith(".py"):
+                # assume VAR=VALUE
+                key, val = arg.split("=", 1)
+                env_vars[key] = val
+            else:
+                cmd_args.append(arg)
+
+        # Extract script name for logging
+        script_path = next(arg for arg in cmd_args if arg.endswith(".py"))
         script_name = script_path.split("/")[-1]
         logger.section(f"[{i}/{len(commands)}] Executing: {script_name}...")
 
-        result = subprocess.run(args)
+        # Merge env_vars into current environment
+        env = os.environ.copy()
+        env.update(env_vars)
+
+        result = subprocess.run(cmd_args, env=env)
 
         if result.returncode != 0:
             logger.warning(
@@ -246,6 +258,7 @@ def run_commands_locally(commands: list[str]) -> None:
             logger.info(f"[{i}/{len(commands)}] ✓ Completed successfully")
 
     logger.section("LOCAL EXECUTION COMPLETE")
+
 
 
 def get_experiments(
