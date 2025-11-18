@@ -423,7 +423,7 @@ def wandb_setup(
     logger.section("Creating workspace views...")
     workspace_urls: dict[str, str] = {}
     for experiment in experiments_list:
-        workspace_url = create_workspace_view(run_id, experiment, project)
+        workspace_url = None #create_workspace_view(run_id, experiment, project)
         workspace_urls[experiment] = workspace_url
 
     # Create report if requested
