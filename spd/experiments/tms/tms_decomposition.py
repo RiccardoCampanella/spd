@@ -74,6 +74,18 @@ def verify_assumption2(
     torch.manual_seed(seed)
     np.random.seed(seed)
     
+    # FIX: Generate a single common random number (CRN) sample for the stochastic mask
+    # This sample r is shared across all components for the gradient calculation,
+    # stabilizing the $s_i$ estimate.
+    # The size should match the shape of the component importance (batch_size, n_components)
+    first_module_name = next(iter(ci.lower_leaky))
+    C = ci.lower_leaky[first_module_name].shape[-1]
+    batch_size = ci.lower_leaky[first_module_name].shape[0]
+    
+    # r ~ Uniform(0, 1) or {0, 1} depending on implementation, here we use Continuous Relaxation
+    # We assume r is independent of component and module, size (batch_size, n_components)
+    r_sample = torch.rand(batch_size, C, device=device)
+    
     # Storage for results
     s_list: list[float] = []
     delta_list: list[float] = []
@@ -98,7 +110,7 @@ def verify_assumption2(
             # ====================================================================
             # Compute Δ(i): Ablation effect
             # ====================================================================
-            # Create mask with only component i ablated (r^(i))
+            # This calculation remains correct, as ablation is deterministic (set g_i=0)
             component_masks_ablate = {}
             for mod_name, mask_vals_mod in ci.lower_leaky.items():
                 comp_mask = mask_vals_mod.clone()
@@ -124,44 +136,51 @@ def verify_assumption2(
             delta_list.append(delta_i)
             
             # ====================================================================
-            # Compute s_i: Gradient of layerwise loss w.r.t. m_i
+            # Compute s_i: Gradient of layerwise loss w.r.t. m_i (FIXED)
             # ====================================================================
-            # For layerwise loss, we need to compute L_stochastic-recon-layerwise^(l)
-            # where l is the layer containing component i
             
-            # Create component masks with gradient enabled for component i
-            component_masks_grad = {}
-            for mod_name, mask_vals_mod in ci.lower_leaky.items():
-                comp_mask = mask_vals_mod.clone().detach()
-                if mod_name == module_name:
-                    comp_mask.requires_grad_(True)
-                component_masks_grad[mod_name] = comp_mask
+            # 1. Create component importance tensor (g_c) and enable gradient tracking
+            g_c_tensor = ci.lower_leaky[module_name].clone().detach()
+            g_c_tensor[:, c].requires_grad_(True)
             
-            mask_infos_grad = make_mask_infos(
-                component_masks=component_masks_grad,
-                routing_masks="all",
-                weight_deltas_and_masks=None
+            # 2. Compute the STOCHASTIC MASK m_c = g_c + (1 - g_c) * r_c (Equation 13)
+            # This is done for ALL components in the layer 'module_name',
+            # using the shared CRN sample 'r_sample'.
+            # Note: The gradient is implicitly computed with respect to g_c[:, c] 
+            # through the chain rule on the constructed m_c.
+            
+            # The mask needs to be computed stochastically for the layer loss,
+            # but using the fixed g_c_tensor with one column requiring grad.
+            
+            # Use calc_stochastic_component_mask_info to generate the full mask info 
+            # including the stochastic part (m_c).
+            # The utility function handles m_c = g_c + (1 - g_c) * r_c
+            mask_infos_stochastic = calc_stochastic_component_mask_info(
+                g_c=g_c_tensor,
+                r_sample=r_sample,
+                module_name=module_name,
             )
+
+            # 3. Forward pass with only layer l masked using the STOCHASTIC mask
+            # The mask_infos dictionary must ONLY contain the layer being tested
+            out_layerwise_stochastic = component_model(batch, mask_infos={module_name: mask_infos_stochastic})
             
-            # Forward pass with only layer l masked (layerwise loss)
-            # This matches L_stochastic-recon-layerwise^(l) from the paper
-            out_layerwise = component_model(batch, mask_infos={module_name: mask_infos_grad[module_name]})
-            
-            # Compute layerwise loss
-            loss_layerwise = calc_sum_recon_loss_lm(
-                pred=out_layerwise,
+            # 4. Compute layerwise loss
+            loss_layerwise_stochastic = calc_sum_recon_loss_lm(
+                pred=out_layerwise_stochastic,
                 target=target_out,
                 loss_type=config.output_loss_type
             )
             
-            # Get gradient w.r.t. component mask m_i
-            comp_mask = mask_infos_grad[module_name].component_mask
-            if not comp_mask.requires_grad:
+            # 5. Get gradient w.r.t. the importance score g_c[:, c]
+            if not g_c_tensor[:, c].requires_grad:
                 s_i = 0.0
             else:
+                # The gradient is taken w.r.t. g_c[:, c], which is the original implementation
+                # of the $s_i$ gradient in terms of implementation details of the paper.
                 grad = torch.autograd.grad(
-                    loss_layerwise,
-                    comp_mask,
+                    loss_layerwise_stochastic,
+                    g_c_tensor[:, c],
                     allow_unused=True,
                     retain_graph=False
                 )[0]
@@ -169,7 +188,8 @@ def verify_assumption2(
                     s_i = 0.0
                 else:
                     # Extract gradient for component i and average
-                    s_i = grad[:, c].mean().item()
+                    # The gradient is the $s_i$ (gradient importance)
+                    s_i = grad.mean().item()
             
             s_list.append(s_i)
     
@@ -196,9 +216,9 @@ def verify_assumption2(
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.scatter(s_list, delta_list, s=20, alpha=0.6, 
               edgecolors='steelblue', linewidths=0.5, facecolors='steelblue')
-    ax.set_xlabel("s_i = ∂L/∂m_i (gradient)", fontsize=13)
+    ax.set_xlabel("s_i = ∂L/∂g_i (stochastic gradient)", fontsize=13)
     ax.set_ylabel("Δ(i) = MSE increase from ablation", fontsize=13)
-    ax.set_title(f"Assumption 2: Gradient vs Ablation Effect ({stage_name}, step {step})\n"
+    ax.set_title(f"Assumption 2: Stochastic Gradient vs Ablation Effect ({stage_name}, step {step})\n"
                 f"Pearson r = {pear.statistic:.4f}",
                 fontsize=14, pad=15)
     ax.grid(True, alpha=0.3, linestyle='--')
@@ -216,9 +236,9 @@ def verify_assumption2(
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.scatter(abs_s_list, delta_list, s=20, alpha=0.6,
               edgecolors='coral', linewidths=0.5, facecolors='coral')
-    ax.set_xlabel("|s_i| = |∂L/∂m_i|", fontsize=13)
+    ax.set_xlabel("|s_i| = |∂L/∂g_i| (stochastic gradient)", fontsize=13)
     ax.set_ylabel("Δ(i) = MSE increase from ablation", fontsize=13)
-    ax.set_title(f"Assumption 2: Absolute Gradient vs Ablation Effect ({stage_name}, step {step})\n"
+    ax.set_title(f"Assumption 2: Absolute Stochastic Gradient vs Ablation Effect ({stage_name}, step {step})\n"
                 f"Pearson r = {pear_abs.statistic:.4f}",
                 fontsize=14, pad=15)
     ax.grid(True, alpha=0.3, linestyle='--')
@@ -465,15 +485,6 @@ def main(
         tied_weights=tied_weights,
     )
 
-        # ====================================================================
-    # Assumption 2 Verification
-    # ====================================================================
-    logger.info("\n" + "="*70)
-    logger.info("Running Assumption 2 Verification")
-    logger.info("="*70)
-    
-    # Load the final trained component model from checkpoint
-    from spd.models.component_model import ComponentModel
     # ====================================================================
     # Assumption 2 Verification
     # ====================================================================
